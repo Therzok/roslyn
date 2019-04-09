@@ -4,9 +4,11 @@ using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Collections.Immutable;
+using System.Composition;
 using System.Diagnostics;
 using System.IO;
 using System.Linq;
+using System.Reflection;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
@@ -14,7 +16,13 @@ using Microsoft.Build.Locator;
 using Microsoft.CodeAnalysis;
 using Microsoft.CodeAnalysis.Diagnostics;
 using Microsoft.CodeAnalysis.Diagnostics.Telemetry;
+using Microsoft.CodeAnalysis.FindSymbols.SymbolTree;
+using Microsoft.CodeAnalysis.Host;
+using Microsoft.CodeAnalysis.Host.Mef;
+using Microsoft.CodeAnalysis.IncrementalCaches;
 using Microsoft.CodeAnalysis.MSBuild;
+using Microsoft.CodeAnalysis.SolutionCrawler;
+using Microsoft.CodeAnalysis.SolutionSize;
 using File = System.IO.File;
 using Path = System.IO.Path;
 
@@ -72,7 +80,7 @@ namespace AnalyzerRunner
                 // Use the latest language version to force the full set of available analyzers to run on the project.
                 { "LangVersion", "latest" },
             };
-            using (MSBuildWorkspace workspace = MSBuildWorkspace.Create(properties))
+            using (MSBuildWorkspace workspace = MSBuildWorkspace.Create(properties, AnalyzerRunnerMefHostServices.DefaultServices))
             {
                 Solution solution = await workspace.OpenSolutionAsync(options.SolutionPath, cancellationToken: cancellationToken).ConfigureAwait(false);
                 var projectIds = solution.ProjectIds;
@@ -103,87 +111,118 @@ namespace AnalyzerRunner
 
                 stopwatch.Restart();
 
-                var analysisResult = await GetAnalysisResultAsync(solution, analyzers, options, cancellationToken).ConfigureAwait(true);
-                var allDiagnostics = analysisResult.Where(pair => pair.Value != null).SelectMany(pair => pair.Value.GetAllDiagnostics()).ToImmutableArray();
+                workspace.Options = workspace.Options.WithChangedOption(Microsoft.CodeAnalysis.Storage.StorageOptions.SolutionSizeThreshold, 0);
 
-                Console.WriteLine($"Found {allDiagnostics.Length} diagnostics in {stopwatch.ElapsedMilliseconds}ms");
-                WriteTelemetry(analysisResult);
+                var exportProvider = ((IMefHostExportProvider)workspace.Services.HostServices);
 
-                if (options.TestDocuments)
+                var solutionSizeTracker = exportProvider.GetExports<IIncrementalAnalyzerProvider>().Where(x => x.Value is SolutionSizeTracker).Select(x => x.Value).Single();
+
+                // This will return the tracker, since it's a singleton.
+                var analyzer = solutionSizeTracker.CreateIncrementalAnalyzer(workspace);
+                await analyzer.NewSolutionSnapshotAsync(workspace.CurrentSolution, CancellationToken.None).ConfigureAwait(false);
+
+                var persistentStorageService = workspace.Services.GetRequiredService<IPersistentStorageService>();
+                var persistentStorage = persistentStorageService.GetStorage(workspace.CurrentSolution);
+                if (persistentStorage is NoOpPersistentStorage)
                 {
-                    var projectPerformance = new Dictionary<ProjectId, double>();
-                    var documentPerformance = new Dictionary<DocumentId, DocumentAnalyzerPerformance>();
-                    foreach (var projectId in solution.ProjectIds)
-                    {
-                        var project = solution.GetProject(projectId);
-                        if (project.Language != LanguageNames.CSharp && project.Language != LanguageNames.VisualBasic)
-                        {
-                            continue;
-                        }
-
-                        foreach (var documentId in project.DocumentIds)
-                        {
-                            var document = project.GetDocument(documentId);
-                            if (!options.TestDocumentMatch(document.FilePath))
-                            {
-                                continue;
-                            }
-
-                            var currentDocumentPerformance = await TestDocumentPerformanceAsync(analyzers, project, documentId, options, cancellationToken).ConfigureAwait(false);
-                            Console.WriteLine($"{document.FilePath ?? document.Name}: {currentDocumentPerformance.EditsPerSecond:0.00}");
-                            documentPerformance.Add(documentId, currentDocumentPerformance);
-                        }
-
-                        var sumOfDocumentAverages = documentPerformance.Where(x => x.Key.ProjectId == projectId).Sum(x => x.Value.EditsPerSecond);
-                        double documentCount = documentPerformance.Where(x => x.Key.ProjectId == projectId).Count();
-                        if (documentCount > 0)
-                        {
-                            projectPerformance[project.Id] = sumOfDocumentAverages / documentCount;
-                        }
-                    }
-
-                    var slowestFiles = documentPerformance.OrderBy(pair => pair.Value.EditsPerSecond).GroupBy(pair => pair.Key.ProjectId);
-                    Console.WriteLine("Slowest files in each project:");
-                    foreach (var projectGroup in slowestFiles)
-                    {
-                        Console.WriteLine($"  {solution.GetProject(projectGroup.Key).Name}");
-                        foreach (var pair in projectGroup.Take(5))
-                        {
-                            var document = solution.GetDocument(pair.Key);
-                            Console.WriteLine($"    {document.FilePath ?? document.Name}: {pair.Value.EditsPerSecond:0.00}");
-                        }
-                    }
-
-                    foreach (var projectId in solution.ProjectIds)
-                    {
-                        if (!projectPerformance.TryGetValue(projectId, out var averageEditsInProject))
-                        {
-                            continue;
-                        }
-
-                        var project = solution.GetProject(projectId);
-                        Console.WriteLine($"{project.Name} ({project.DocumentIds.Count} documents): {averageEditsInProject:0.00} edits per second");
-                    }
+                    throw new InvalidOperationException("Benchmark is not configured to use persistent storage.");
                 }
 
-                foreach (var group in allDiagnostics.GroupBy(diagnostic => diagnostic.Id).OrderBy(diagnosticGroup => diagnosticGroup.Key, StringComparer.OrdinalIgnoreCase))
-                {
-                    Console.WriteLine($"  {group.Key}: {group.Count()} instances");
+                var incrementalAnalyzerProvider = exportProvider.GetExports<IIncrementalAnalyzerProvider>().Where(x => x.Value is SymbolTreeInfoIncrementalAnalyzerProvider).Select(x => x.Value).Single();
+                var incrementalAnalyzer = incrementalAnalyzerProvider.CreateIncrementalAnalyzer(workspace);
+                var solutionCrawlerRegistrationService = (SolutionCrawlerRegistrationService)workspace.Services.GetRequiredService<ISolutionCrawlerRegistrationService>();
+                solutionCrawlerRegistrationService.Register(workspace);
+                solutionCrawlerRegistrationService.WaitUntilCompletion_ForTestingPurposesOnly(workspace, ImmutableArray.Create(incrementalAnalyzer));
 
-                    // Print out analyzer diagnostics like AD0001 for analyzer exceptions
-                    if (group.Key.StartsWith("AD", StringComparison.Ordinal))
-                    {
-                        foreach (var item in group)
-                        {
-                            Console.WriteLine(item);
-                        }
-                    }
+                var symbolTreeInfoCacheService = workspace.Services.GetRequiredService<ISymbolTreeInfoCacheService>();
+                var symbolTreeInfo = await symbolTreeInfoCacheService.TryGetSourceSymbolTreeInfoAsync(workspace.CurrentSolution.Projects.First(), CancellationToken.None).ConfigureAwait(false);
+                if (symbolTreeInfo is null)
+                {
+                    throw new InvalidOperationException("Benchmark failed to calculate symbol tree info.");
                 }
 
-                if (!string.IsNullOrWhiteSpace(options.LogFileName))
-                {
-                    WriteDiagnosticResults(analysisResult.SelectMany(pair => pair.Value.GetAllDiagnostics().Select(j => Tuple.Create(pair.Key, j))).ToImmutableArray(), options.LogFileName);
-                }
+
+                //var analysisResult = await GetAnalysisResultAsync(solution, analyzers, options, cancellationToken).ConfigureAwait(true);
+                //var allDiagnostics = analysisResult.Where(pair => pair.Value != null).SelectMany(pair => pair.Value.GetAllDiagnostics()).ToImmutableArray();
+
+                //Console.WriteLine($"Found {allDiagnostics.Length} diagnostics in {stopwatch.ElapsedMilliseconds}ms");
+                //WriteTelemetry(analysisResult);
+
+                //if (options.TestDocuments)
+                //{
+                //    var projectPerformance = new Dictionary<ProjectId, double>();
+                //    var documentPerformance = new Dictionary<DocumentId, DocumentAnalyzerPerformance>();
+                //    foreach (var projectId in solution.ProjectIds)
+                //    {
+                //        var project = solution.GetProject(projectId);
+                //        if (project.Language != LanguageNames.CSharp && project.Language != LanguageNames.VisualBasic)
+                //        {
+                //            continue;
+                //        }
+
+                //        foreach (var documentId in project.DocumentIds)
+                //        {
+                //            var document = project.GetDocument(documentId);
+                //            if (!options.TestDocumentMatch(document.FilePath))
+                //            {
+                //                continue;
+                //            }
+
+                //            var currentDocumentPerformance = await TestDocumentPerformanceAsync(analyzers, project, documentId, options, cancellationToken).ConfigureAwait(false);
+                //            Console.WriteLine($"{document.FilePath ?? document.Name}: {currentDocumentPerformance.EditsPerSecond:0.00}");
+                //            documentPerformance.Add(documentId, currentDocumentPerformance);
+                //        }
+
+                //        var sumOfDocumentAverages = documentPerformance.Where(x => x.Key.ProjectId == projectId).Sum(x => x.Value.EditsPerSecond);
+                //        double documentCount = documentPerformance.Where(x => x.Key.ProjectId == projectId).Count();
+                //        if (documentCount > 0)
+                //        {
+                //            projectPerformance[project.Id] = sumOfDocumentAverages / documentCount;
+                //        }
+                //    }
+
+                //    var slowestFiles = documentPerformance.OrderBy(pair => pair.Value.EditsPerSecond).GroupBy(pair => pair.Key.ProjectId);
+                //    Console.WriteLine("Slowest files in each project:");
+                //    foreach (var projectGroup in slowestFiles)
+                //    {
+                //        Console.WriteLine($"  {solution.GetProject(projectGroup.Key).Name}");
+                //        foreach (var pair in projectGroup.Take(5))
+                //        {
+                //            var document = solution.GetDocument(pair.Key);
+                //            Console.WriteLine($"    {document.FilePath ?? document.Name}: {pair.Value.EditsPerSecond:0.00}");
+                //        }
+                //    }
+
+                //    foreach (var projectId in solution.ProjectIds)
+                //    {
+                //        if (!projectPerformance.TryGetValue(projectId, out var averageEditsInProject))
+                //        {
+                //            continue;
+                //        }
+
+                //        var project = solution.GetProject(projectId);
+                //        Console.WriteLine($"{project.Name} ({project.DocumentIds.Count} documents): {averageEditsInProject:0.00} edits per second");
+                //    }
+                //}
+
+                //foreach (var group in allDiagnostics.GroupBy(diagnostic => diagnostic.Id).OrderBy(diagnosticGroup => diagnosticGroup.Key, StringComparer.OrdinalIgnoreCase))
+                //{
+                //    Console.WriteLine($"  {group.Key}: {group.Count()} instances");
+
+                //    // Print out analyzer diagnostics like AD0001 for analyzer exceptions
+                //    if (group.Key.StartsWith("AD", StringComparison.Ordinal))
+                //    {
+                //        foreach (var item in group)
+                //        {
+                //            Console.WriteLine(item);
+                //        }
+                //    }
+                //}
+
+                //if (!string.IsNullOrWhiteSpace(options.LogFileName))
+                //{
+                //    WriteDiagnosticResults(analysisResult.SelectMany(pair => pair.Value.GetAllDiagnostics().Select(j => Tuple.Create(pair.Key, j))).ToImmutableArray(), options.LogFileName);
+                //}
             }
         }
 
@@ -545,6 +584,58 @@ namespace AnalyzerRunner
             {
                 get;
             }
+        }
+
+        static class AnalyzerRunnerMefHostServices
+        {
+            private static MefHostServices s_defaultServices;
+            public static MefHostServices DefaultServices
+            {
+                get
+                {
+                    if (s_defaultServices == null)
+                    {
+                        Interlocked.CompareExchange(ref s_defaultServices, MefHostServices.Create(DefaultAssemblies), null);
+                    }
+
+                    return s_defaultServices;
+                }
+            }
+
+            private static ImmutableArray<Assembly> s_defaultAssemblies;
+            public static ImmutableArray<Assembly> DefaultAssemblies
+            {
+                get
+                {
+                    if (s_defaultAssemblies == null)
+                    {
+                        ImmutableInterlocked.InterlockedCompareExchange(ref s_defaultAssemblies, CreateDefaultAssemblies(), default);
+                    }
+
+                    return s_defaultAssemblies;
+                }
+            }
+
+            private static ImmutableArray<Assembly> CreateDefaultAssemblies()
+            {
+                var assemblyNames = new string[]
+                {
+                    typeof(Program).Assembly.GetName().Name,
+                };
+
+                return MSBuildMefHostServices.DefaultAssemblies.Concat(
+                    MefHostServices.LoadNearbyAssemblies(assemblyNames));
+            }
+        }
+
+        [ExportWorkspaceService(typeof(IPersistentStorageLocationService), ServiceLayer.Host), Shared]
+        internal class PersistentStorageLocationService : IPersistentStorageLocationService
+        {
+            public event EventHandler<PersistentStorageLocationChangingEventArgs> StorageLocationChanging;
+
+            public bool IsSupported(Workspace workspace) => true;
+
+            public string TryGetStorageLocation(SolutionId solutionId) => @"E:\therzok\roslyn\test-db";
         }
     }
 }
